@@ -36,6 +36,8 @@ cd "Luna - Devkit"
 ./luna-devkit start --watch
 ```
 
+The dev window enables **Input → Inhibit system shortcuts** at startup, so keyboard shortcuts go to the virtual desktop while it is focused. You can turn this off in the window’s Input menu.
+
 Each start builds the linked projects and opens the viewer. Close it or press Ctrl+C to stop. Starting again shuts down the previous interactive session cleanly. An active headless test is not interrupted.
 
 The session restarts fully when sources change; the private profile survives. If a build fails, watch mode waits for your next edit and retries.

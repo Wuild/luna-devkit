@@ -79,6 +79,8 @@ try:
     command += sys.argv[1:] if headless else ['--devkit', '--wayland-display', 'luna-devkit']
     child = subprocess.Popen(command)
     children.append(child)
+    if not headless:
+        children.append(subprocess.Popen(['gjs', '-m', str(Path(__file__).with_name('inhibit-shortcuts.js'))]))
     status = child.wait()
 except KeyboardInterrupt:
     status = 0
