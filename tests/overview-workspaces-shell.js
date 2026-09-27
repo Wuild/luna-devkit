@@ -1,0 +1,42 @@
+import Gio from 'gi://Gio';
+import Clutter from 'gi://Clutter';
+import Shell from 'gi://Shell';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as Scripting from 'resource:///org/gnome/shell/ui/scripting.js';
+function assert(v,m){if(!v)throw new Error(m);}
+export async function run(){
+ await Scripting.sleep(2200); Main.overview.hide();
+ const desktop=Main.extensionManager.lookup('luna-desktop@wuild').stateObj;
+ desktop.settings.set_boolean('desktop-widgets-enabled',true);
+ desktop.settings.set_strv('desktop-enabled-widgets',['clock','resources']);
+ const r=Main.extensionManager.lookup('luna-taskbar@wuild').stateObj.runtime;
+ r._settings.set_boolean('show-workspace-switcher',true);
+ r._settings.set_boolean('taskbar-scroll-workspaces',true);
+ r._settings.set_string('taskbar-position','bottom');
+ r._settings.set_string('visibility-mode','always');
+ await Scripting.sleep(800);
+ const surfaces=()=>global.get_window_actors().map(a=>a.meta_window).filter(w=>w.get_title()?.startsWith('Luna Desktop:'));
+ const original=surfaces()[0]; assert(original,'Desktop window exists');
+ const bridge=desktop.controller._overviewWidgets;
+ let scans=0; const sync=bridge.sync.bind(bridge);bridge.sync=()=>{scans++;return sync();};
+ Main.overview.show(); await Scripting.sleep(1000);
+ assert(bridge.layers.size>0,'Workspace widget layers exist');
+ assert([...bridge.layers.values()].some(record=>record.clones.size>0),'Live desktop clone exists');
+ const count=scans;await Scripting.sleep(600);assert(scans===count,'No periodic overview tree scans');
+ assert(surfaces()[0]===original,'Overview preserves desktop window');
+ const stream=Gio.File.new_for_path('/tmp/luna-overview-widgets.png').replace(null,false,Gio.FileCreateFlags.NONE,null);
+ await new Shell.Screenshot().screenshot(false,stream);stream.close(null);
+ Main.overview.hide();await Scripting.sleep(500);
+ assert(bridge.layers.size===0,'Preview actors cleaned up');
+ assert(surfaces()[0]===original,'Leaving overview preserves desktop window');
+ const wm=global.workspace_manager;
+ assert(r._workspaceSwitcher.actor.visible,'Workspace applet enabled');
+ const buttons=r._workspaceSwitcher.actor.get_children();assert(buttons.length===wm.n_workspaces,'Workspace count matches');
+ buttons[1].emit('clicked',1);await Scripting.sleep(500);assert(wm.get_active_workspace_index()===1,'Applet switches workspace');
+ const pointer=Clutter.get_default_backend().get_default_seat().create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
+ const [x,y]=r._workspaceSwitcher.actor.get_transformed_position();
+ pointer.notify_absolute_motion(0,x+10,y+10);await Scripting.sleep(100);
+ pointer.notify_discrete_scroll(0,Clutter.ScrollDirection.UP,Clutter.ScrollSource.WHEEL);await Scripting.sleep(500);
+ assert(wm.get_active_workspace_index()===0,'Scrolling taskbar switches workspace');
+ print('OVERVIEW_WORKSPACES_PASS scans='+scans);
+}

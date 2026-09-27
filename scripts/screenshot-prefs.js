@@ -1,0 +1,14 @@
+import Adw from 'gi://Adw';
+import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
+Gio.resources_register(Gio.Resource.load('/usr/share/gnome-shell/org.gnome.Shell.Extensions.src.gresource'));
+Adw.init();
+const path = ARGV[0];
+const {default: Preferences} = await import(GLib.filename_to_uri(`${path}/prefs.js`, null));
+const metadata = JSON.parse(new TextDecoder().decode(Gio.File.new_for_path(`${path}/metadata.json`).load_contents(null)[1]));
+Object.assign(metadata, {path, dir: Gio.File.new_for_path(path)});
+const prefs = new Preferences(metadata);
+const window = new Adw.PreferencesWindow();
+await prefs.fillPreferencesWindow(window);
+window.present();
+new GLib.MainLoop(null, false).run();

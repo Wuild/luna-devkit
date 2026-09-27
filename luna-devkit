@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""Isolated GNOME development sessions for a collection of local extensions."""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parent
+CONFIG = ROOT / 'extensions.local.json'
+if not CONFIG.exists():
+    CONFIG = ROOT / 'extensions.json'
+STATE = ROOT / '.state'
+
+
+class RestartRequested(Exception):
+    pass
+
+
+def check_restart():
+    if (STATE / 'restart-request').exists():
+        raise RestartRequested()
+
+
+@contextmanager
+def session_lock(headless):
+    STATE.mkdir(exist_ok=True)
+    request = STATE / 'restart-request'
+    with (STATE / 'lock').open('a+') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.seek(0)
+            if headless or lock.read().strip() != 'start':
+                raise ValueError('A Devkit session is already running in this project')
+            print('Restarting the existing Devkit session …', flush=True)
+            request.touch()
+            deadline = time.monotonic() + 60
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError('Timed out waiting for the existing Devkit session to stop')
+                    time.sleep(.1)
+        request.unlink(missing_ok=True)
+        lock.seek(0)
+        lock.truncate()
+        lock.write('test' if headless else 'start')
+        lock.flush()
+        try:
+            yield
+        except RestartRequested:
+            print('Devkit session stopped for restart.', flush=True)
+
+
+@contextmanager
+def private_runtime():
+    directory = Path(tempfile.mkdtemp(prefix='luna-devkit-runtime-'))
+    try:
+        yield directory
+    finally:
+        # A portal can leave a transient FUSE mount; never traverse it.
+        result = subprocess.run(['rm', '-rf', '--one-file-system', str(directory)], capture_output=True)
+        if result.returncode:
+            print(f'Temporary portal mount remains at {directory}', file=sys.stderr)
+
+
+def configure_tools():
+    pnpm = shutil.which('pnpm')
+    if pnpm and not shutil.which('node'):
+        candidate = Path(pnpm).parent.parent.parent / 'node/bin'
+        if (candidate / 'node').is_file():
+            os.environ['PATH'] = str(candidate) + os.pathsep + os.environ.get('PATH', '')
+
+
+def read_json(path):
+    return json.loads(path.read_text())
+
+
+def registry():
+    value = read_json(CONFIG)
+    if not isinstance(value, dict) or not isinstance(value.get('extensions'), list):
+        raise ValueError('extensions.json must contain an extensions array')
+    return value
+
+
+def resolve_entry(entry):
+    source = (ROOT / entry['path']).resolve()
+    output = Path(entry.get('output', 'dist'))
+    if output.is_absolute() or '..' in output.parts:
+        raise ValueError('Output must be a directory inside the extension project')
+    manifest = read_json(source / 'metadata.json')
+    uuid = manifest['uuid']
+    if not isinstance(uuid, str) or not re.fullmatch(r'[A-Za-z0-9@._+-]+', uuid) or uuid in ('.', '..'):
+        raise ValueError(f'Invalid extension UUID: {uuid!r}')
+    build = entry.get('build', ['pnpm', 'build'])
+    if not isinstance(build, list) or not all(isinstance(arg, str) for arg in build):
+        raise ValueError('Build must be an array of command arguments, or []')
+    return dict(entry, source=source, output=source / output, uuid=uuid, name=manifest['name'], build=build)
+
+
+def projects():
+    result = [resolve_entry(e) for e in registry()['extensions'] if e.get('enabled', True)]
+    uuids = [e['uuid'] for e in result]
+    if len(set(uuids)) != len(uuids):
+        raise ValueError('Two enabled projects have the same extension UUID')
+    return result
+
+
+def build_all(items):
+    for item in items:
+        print(f"Building {item['name']} …", flush=True)
+        if item['build']:
+            subprocess.run(item['build'], cwd=item['source'], check=True)
+        manifest = item['output'] / 'metadata.json'
+        if not manifest.is_file() or read_json(manifest)['uuid'] != item['uuid']:
+            raise ValueError(f"Missing or mismatched build: {manifest}")
+        for filename in ['extension.js']:
+            if not (item['output'] / filename).is_file():
+                raise ValueError(f"Build is missing {filename}: {item['output']}")
+
+
+def prepare_profile(profile, items):
+    for folder in ['config', 'data/gnome-shell/extensions', 'cache', 'Desktop']:
+        (profile / folder).mkdir(parents=True, exist_ok=True)
+    desktop = str(profile / 'Desktop').replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$')
+    (profile / 'config/user-dirs.dirs').write_text(f'XDG_DESKTOP_DIR="{desktop}"\n')
+    links = profile / 'data/gnome-shell/extensions'
+    for existing in links.iterdir():
+        if existing.is_symlink():
+            existing.unlink()
+        else:
+            raise ValueError(f'Unexpected non-link in managed extension directory: {existing}')
+    for item in items:
+        (links / item['uuid']).symlink_to(item['output'], target_is_directory=True)
+
+
+def session_environment(profile, runtime, items, headless):
+    env = os.environ.copy()
+    if not headless:
+        display = env.get('WAYLAND_DISPLAY')
+        if not display:
+            raise ValueError('Start the viewer from a Wayland desktop (WAYLAND_DISPLAY is missing)')
+        outer = Path(display) if display.startswith('/') else Path(env['XDG_RUNTIME_DIR']) / display
+        if not outer.exists():
+            raise ValueError(f'Outer Wayland socket does not exist: {outer}')
+        env['WAYLAND_DISPLAY'] = str(outer)
+    else:
+        env.pop('WAYLAND_DISPLAY', None)
+    # Never inherit schema/profile overrides from another extension's dev session.
+    for key in ['DBUS_SESSION_BUS_ADDRESS', 'DBUS_SESSION_BUS_PID', 'GSETTINGS_SCHEMA_DIR', 'DESKTOP_AUTOSTART_ID']:
+        env.pop(key, None)
+    env.update(XDG_CONFIG_HOME=str(profile / 'config'), XDG_DATA_HOME=str(profile / 'data'),
+               XDG_CACHE_HOME=str(profile / 'cache'), XDG_RUNTIME_DIR=str(runtime),
+               GSETTINGS_BACKEND='keyfile', GIO_USE_VFS='local', GTK_A11Y='none',
+               LUNA_DEVKIT_ROOT=str(ROOT), LUNA_DEVKIT_RUNTIME=str(runtime),
+               LUNA_DEVKIT_UUIDS=json.dumps([item['uuid'] for item in items]),
+               LUNA_DEVKIT_PROJECTS=json.dumps({item['uuid']: str(item['source']) for item in items}))
+    return env
+
+
+def stop_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    # The bus leader can exit before its applications. Finish their cleanup
+    # before a build removes and replaces the linked dist directories.
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(.1)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def snapshot(items):
+    files = [CONFIG]
+    for item in items:
+        for base, dirs, names in os.walk(item['source']):
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', 'dist', '__pycache__']]
+            files.extend(Path(base) / name for name in names if not name.startswith('.') and not name.endswith(('.zip', '.tgz', '.pyc')))
+    result = {}
+    for file in files:
+        try:
+            stat = file.stat()
+            result[str(file)] = (stat.st_mtime_ns, stat.st_size)
+        except FileNotFoundError:
+            pass
+    return result
+
+
+def doctor(headless=False):
+    required = ['gnome-shell', 'gjs', 'dbus-run-session', 'gsettings', 'glib-compile-schemas']
+    missing = [name for name in required if not shutil.which(name)]
+    if not headless and not Path('/usr/libexec/mutter-devkit').is_file():
+        missing.append('/usr/libexec/mutter-devkit (install the matching distro mutter-devkit package)')
+    if missing:
+        raise ValueError('Missing dependencies: ' + ', '.join(missing))
+    print(subprocess.check_output(['gnome-shell', '--version'], text=True).strip())
+    for name in ['pnpm', 'pipewire', 'wireplumber']:
+        print(f'{name}: {shutil.which(name) or "not found"}')
+
+
+def launch(args):
+    headless = args.command == 'test'
+    doctor(headless)
+    with session_lock(headless):
+        temporary = tempfile.TemporaryDirectory(prefix='luna-devkit-test-') if headless else None
+        profile = Path(temporary.name) if temporary else STATE / 'profile'
+        try:
+            while True:
+                check_restart()
+                items = projects()
+                try:
+                    build_all(items)
+                except (OSError, ValueError, subprocess.CalledProcessError) as error:
+                    if headless or not args.watch:
+                        raise
+                    print(f'Build failed: {error}. Waiting for another source edit …', flush=True)
+                    failed_snapshot = snapshot(items)
+                    while snapshot(items) == failed_snapshot:
+                        check_restart()
+                        time.sleep(0.5)
+                    continue
+                check_restart()
+                prepare_profile(profile, items)
+                before = snapshot(items)
+                with private_runtime() as runtime:
+                    directory = str(runtime)
+                    env = session_environment(profile, runtime, items, headless)
+                    command = ['dbus-run-session', '--', sys.executable, str(ROOT / 'scripts/session.py')]
+                    if headless:
+                        command += ['--headless', '--automation-script', str(ROOT / 'tests/integration.js')]
+                        for monitor in args.monitor or ['1280x800']:
+                            command += ['--virtual-monitor', monitor]
+                    logfile = STATE / ('test.log' if headless else 'shell.log')
+                    print(f"Starting {'headless test' if headless else 'virtual desktop'}; logs: {logfile}", flush=True)
+                    with logfile.open('w') as log:
+                        process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                        (STATE / 'session.json').write_text(json.dumps({'runtime': directory, 'pid': process.pid, 'headless': headless}))
+                        restart = False
+                        deadline = time.monotonic() + 100 if headless else float('inf')
+                        try:
+                            while process.poll() is None:
+                                check_restart()
+                                if time.monotonic() > deadline:
+                                    raise ValueError(f'Test timed out. See {logfile}')
+                                if not headless and args.watch and snapshot(items) != before:
+                                    time.sleep(0.5)
+                                    print('Source changed; rebuilding and restarting the virtual desktop …', flush=True)
+                                    restart = True
+                                    break
+                                time.sleep(0.3)
+                        finally:
+                            stop_group(process)
+                            (STATE / 'session.json').unlink(missing_ok=True)
+                        if not restart:
+                            if process.returncode:
+                                print(logfile.read_text()[-10000:], file=sys.stderr)
+                                raise ValueError(f'Virtual session exited with status {process.returncode}; see {logfile}')
+                            if headless and 'LUNA_DEVKIT_INTEGRATION_PASS' not in logfile.read_text():
+                                raise ValueError(f'Integration script did not complete; see {logfile}')
+                            if headless:
+                                print('LUNA_DEVKIT_INTEGRATION_PASS')
+                            return
+        finally:
+            if temporary:
+                temporary.cleanup()
+
+
+def run_inside(command):
+    descriptor = STATE / 'session.json'
+    if not descriptor.exists():
+        raise ValueError('No running Devkit session. Start it with ./luna-devkit start')
+    session = read_json(descriptor)
+    if session['headless']:
+        raise ValueError('The headless test session does not accept interactive commands')
+    environment = Path(session['runtime']) / 'environment.json'
+    if not environment.exists():
+        raise ValueError('The Devkit session is still starting; try again shortly')
+    subprocess.run(['gjs', '-m', str(ROOT / 'scripts/run.js'), str(environment), *command], check=True)
+
+
+def main():
+    configure_tools()
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('list', help='List linked projects')
+    link = sub.add_parser('link', help='Register a standalone extension project')
+    link.add_argument('path'); link.add_argument('--output', default='dist')
+    link.add_argument('--no-build', action='store_true', help='Use an already built/plain JavaScript extension')
+    unlink = sub.add_parser('unlink'); unlink.add_argument('uuid')
+    sub.add_parser('build', help='Build all enabled extensions')
+    sub.add_parser('doctor', help='Check installed runtime tools')
+    start = sub.add_parser('start', help='Open the virtual desktop')
+    start.add_argument('--watch', action='store_true', help='Rebuild and restart the session on source changes')
+    test = sub.add_parser('test', help='Run all linked extensions in an isolated headless GNOME')
+    test.add_argument('--monitor', action='append', help='Virtual monitor WxH; repeat for multiple displays')
+    run = sub.add_parser('run', help='Launch a command inside the virtual desktop')
+    run.add_argument('argv', nargs=argparse.REMAINDER)
+    prefs = sub.add_parser('prefs'); prefs.add_argument('uuid')
+    args = parser.parse_args()
+    if args.command == 'list':
+        for entry in registry()['extensions']:
+            item = resolve_entry(entry)
+            print(f"{item['uuid']} [{ 'enabled' if item.get('enabled', True) else 'disabled' }]\n  {item['source']} → {item['output']}")
+    elif args.command == 'link':
+        entry = {'path': os.path.relpath(Path(args.path).resolve(), ROOT), 'output': args.output, 'enabled': True}
+        if args.no_build:
+            entry['build'] = []
+        item = resolve_entry(entry)
+        value = registry()
+        value['extensions'] = [e for e in value['extensions'] if resolve_entry(e)['uuid'] != item['uuid']] + [entry]
+        CONFIG.write_text(json.dumps(value, indent=2) + '\n')
+        print(f"Linked {item['name']}; takes effect on the next session start/restart")
+    elif args.command == 'unlink':
+        value = registry()
+        value['extensions'] = [e for e in value['extensions'] if resolve_entry(e)['uuid'] != args.uuid]
+        CONFIG.write_text(json.dumps(value, indent=2) + '\n')
+    elif args.command == 'build':
+        build_all(projects())
+    elif args.command == 'doctor':
+        doctor()
+    elif args.command in ('start', 'test'):
+        launch(args)
+    elif args.command == 'prefs':
+        if args.uuid not in [e['uuid'] for e in projects()]:
+            raise ValueError('That extension is not linked and enabled')
+        run_inside(['gnome-extensions', 'prefs', args.uuid])
+    elif args.command == 'run':
+        command = args.argv[1:] if args.argv[:1] == ['--'] else args.argv
+        if not command:
+            raise ValueError('Provide a command, for example: ./luna-devkit run gtk4-demo')
+        run_inside(command)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f'Luna - Devkit: {error}', file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -1,0 +1,19 @@
+{
+  "extensions": [
+    {
+      "path": "../Luna - Taskbar",
+      "output": "dist",
+      "enabled": true
+    },
+    {
+      "path": "../Luna - Desktop",
+      "output": "dist",
+      "enabled": true
+    },
+    {
+      "path": "../Luna - Wallpaper",
+      "output": "dist",
+      "enabled": true
+    }
+  ]
+}
