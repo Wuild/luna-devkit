@@ -64,9 +64,12 @@ From another terminal in the Devkit directory:
 ./luna-devkit prefs luna-desktop@wuild
 ./luna-devkit prefs luna-wallpaper@wuild
 ./luna-devkit run gtk4-demo
+./luna-devkit panel
 ```
 
 Commands use the private display and session bus. Apps that forward to an existing instance may need their own new-instance option. GNOME may show its native sharing indicator because the viewer uses screencasting.
+
+Open **Luna Devkit Test Panel** from the virtual desktop’s app grid, or run `./luna-devkit panel`. It provides editable notification titles and bodies, normal/critical urgency, grouped samples, scrolling samples, and a button to clear its own notifications. It also opens sample windows for taskbar and tiling checks, switches light/dark appearance and animations, restores the appearance from when the panel opened, and opens installed Luna extension settings. `./luna-devkit notifications` remains an alias. The app-grid launcher appears on the next Devkit start. These controls affect the Devkit session, not your host desktop.
 
 **This is a separate desktop session, not a filesystem sandbox.** Apps still have your user’s file permissions. In particular, Wallpaper’s administrator-only GDM helper affects the real system even when opened from Devkit.
 

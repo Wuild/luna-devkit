@@ -56,6 +56,15 @@ try:
         background_marker.parent.mkdir(parents=True, exist_ok=True)
         background_marker.touch()
     if not headless:
+        applications = Path(os.environ['XDG_DATA_HOME']) / 'applications'
+        applications.mkdir(parents=True, exist_ok=True)
+        panel_script = str(Path(__file__).with_name('test-panel.js').resolve())
+        quoted_script = panel_script.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%')
+        (applications / 'org.luna.Devkit.TestPanel.desktop').write_text(
+            '[Desktop Entry]\nType=Application\nName=Luna Devkit Test Panel\n'
+            'Comment=Notifications, sample windows and test settings\n'
+            'Icon=applications-development-symbolic\n'
+            f'Exec=gjs -m "{quoted_script}"\nTerminal=false\nCategories=Development;\n')
         if not shutil.which('pipewire') or not shutil.which('wireplumber'):
             raise RuntimeError('The interactive viewer requires pipewire and wireplumber')
         for command in [['pipewire'], ['wireplumber', '--profile=policy']]:

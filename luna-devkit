@@ -321,6 +321,8 @@ def main():
     run = sub.add_parser('run', help='Launch a command inside the virtual desktop')
     run.add_argument('argv', nargs=argparse.REMAINDER)
     prefs = sub.add_parser('prefs'); prefs.add_argument('uuid')
+    sub.add_parser('notifications', help='Open a grouped-notification tester inside the virtual desktop')
+    sub.add_parser('panel', help='Open the Devkit test control panel inside the virtual desktop')
     args = parser.parse_args()
     if args.command == 'list':
         for entry in registry()['extensions']:
@@ -354,6 +356,8 @@ def main():
         if not command:
             raise ValueError('Provide a command, for example: ./luna-devkit run gtk4-demo')
         run_inside(command)
+    elif args.command in ('notifications', 'panel'):
+        run_inside(['gjs', '-m', str(ROOT / 'scripts/test-panel.js')])
 
 
 if __name__ == '__main__':
